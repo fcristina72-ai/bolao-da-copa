@@ -1,0 +1,1207 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "d91ef744",
+   "metadata": {},
+   "source": [
+    "# Copa do Mundo FIFA 2026 — Previsão da 1ª rodada com Rede Neural (TensorFlow)\n",
+    "\n",
+    "## 1. Introdução\n",
+    "**Hipótese.** A força relativa de cada seleção pode ser resumida por um **rating Elo**\n",
+    "construído a partir de todos os jogos internacionais da história, e a *quantidade de gols*\n",
+    "de cada lado em uma partida segue aproximadamente uma **distribuição de Poisson** cuja taxa\n",
+    "(λ) depende dessa força, do mando de campo e da forma recente.\n",
+    "\n",
+    "**Abordagem.** Treinamos uma **rede neural funcional em Keras** que recebe a identidade das\n",
+    "duas seleções (via *embeddings* de ataque e defesa) e um vetor de features numéricas, e produz\n",
+    "**duas taxas de Poisson** (λ do time 1 e do time 2). A rede é treinada com **perda de Poisson**.\n",
+    "Para cada jogo, em vez de simplesmente usar o placar mais provável, escolhemos o placar que\n",
+    "**maximiza os pontos esperados na regra do bolão** (5 pts placar exato, 2 pts resultado, 0 erro).\n",
+    "\n",
+    "> Reprodutível: o notebook baixa os dados sozinho, fixa sementes e roda do início ao fim.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "id": "91df64bf",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:25.225118Z",
+     "iopub.status.busy": "2026-06-09T17:38:25.224967Z",
+     "iopub.status.idle": "2026-06-09T17:38:28.953658Z",
+     "shell.execute_reply": "2026-06-09T17:38:28.952557Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\n",
+      "I0000 00:00:1781026705.662299    1782 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.\n"
+     ]
+    },
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "WARNING: All log messages before absl::InitializeLog() is called are written to STDERR\n",
+      "I0000 00:00:1781026707.413264    1782 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.\n"
+     ]
+    },
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "TF 2.21.0\n"
+     ]
+    }
+   ],
+   "source": [
+    "# Dependencias (descomente para instalar):\n",
+    "# !pip install tensorflow-cpu pandas numpy scipy\n",
+    "import os, json, random, urllib.request\n",
+    "import numpy as np, pandas as pd, tensorflow as tf\n",
+    "from scipy.stats import poisson\n",
+    "\n",
+    "# ----- Reprodutibilidade -----\n",
+    "SEED = 42\n",
+    "os.environ[\"PYTHONHASHSEED\"] = str(SEED)\n",
+    "random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)\n",
+    "\n",
+    "# ----- PREENCHA AQUI -----\n",
+    "NOME  = \"Flavia Cristina de Sousa Silva Dias Paz\"\n",
+    "TURMA = \"2/2026\"\n",
+    "\n",
+    "print(\"TF\", tf.__version__)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6b612b1c",
+   "metadata": {},
+   "source": [
+    "## 2. Dados\n",
+    "**Fonte principal:** `martj42/international_results` (GitHub) — resultados de **todos os jogos\n",
+    "internacionais de seleções desde 1872**, atualizado continuamente. Colunas: data, mandante,\n",
+    "visitante, placar, torneio, cidade/país e *flag* de campo neutro.\n",
+    "\n",
+    "**Por que é relevante:** cobre amistosos, eliminatórias, Nations League e finais de Copa/continentais,\n",
+    "permitindo (a) calcular um Elo consistente e (b) treinar a rede com dezenas de milhares de exemplos.\n",
+    "\n",
+    "**Sem vazamento:** usamos **apenas jogos com placar já registrado**. Os 72 jogos da Copa 2026 já\n",
+    "constam na base, porém **sem placar** (`NA`) — são descartados do treino. O último jogo com placar\n",
+    "disponível é de **08/06/2026**.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 2,
+   "id": "2f52d2e0",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:28.956713Z",
+     "iopub.status.busy": "2026-06-09T17:38:28.955651Z",
+     "iopub.status.idle": "2026-06-09T17:38:29.151496Z",
+     "shell.execute_reply": "2026-06-09T17:38:29.150322Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Jogos com placar: 49378 | 1872-11-30 a 2026-06-08\n"
+     ]
+    },
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>date</th>\n",
+       "      <th>home_team</th>\n",
+       "      <th>away_team</th>\n",
+       "      <th>home_score</th>\n",
+       "      <th>away_score</th>\n",
+       "      <th>tournament</th>\n",
+       "      <th>city</th>\n",
+       "      <th>country</th>\n",
+       "      <th>neutral</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>49375</th>\n",
+       "      <td>2026-06-08</td>\n",
+       "      <td>Peru</td>\n",
+       "      <td>Spain</td>\n",
+       "      <td>1</td>\n",
+       "      <td>3</td>\n",
+       "      <td>Friendly</td>\n",
+       "      <td>Puebla</td>\n",
+       "      <td>Mexico</td>\n",
+       "      <td>True</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>49376</th>\n",
+       "      <td>2026-06-08</td>\n",
+       "      <td>France</td>\n",
+       "      <td>Northern Ireland</td>\n",
+       "      <td>3</td>\n",
+       "      <td>1</td>\n",
+       "      <td>Friendly</td>\n",
+       "      <td>Lille</td>\n",
+       "      <td>France</td>\n",
+       "      <td>False</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>49377</th>\n",
+       "      <td>2026-06-08</td>\n",
+       "      <td>Mauritania</td>\n",
+       "      <td>Niger</td>\n",
+       "      <td>1</td>\n",
+       "      <td>0</td>\n",
+       "      <td>Friendly</td>\n",
+       "      <td>Casablanca</td>\n",
+       "      <td>Morocco</td>\n",
+       "      <td>True</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "            date   home_team         away_team  home_score  away_score  \\\n",
+       "49375 2026-06-08        Peru             Spain           1           3   \n",
+       "49376 2026-06-08      France  Northern Ireland           3           1   \n",
+       "49377 2026-06-08  Mauritania             Niger           1           0   \n",
+       "\n",
+       "      tournament        city  country  neutral  \n",
+       "49375   Friendly      Puebla   Mexico     True  \n",
+       "49376   Friendly       Lille   France    False  \n",
+       "49377   Friendly  Casablanca  Morocco     True  "
+      ]
+     },
+     "execution_count": 2,
+     "metadata": {},
+     "output_type": "execute_result"
+    }
+   ],
+   "source": [
+    "URL = \"https://raw.githubusercontent.com/martj42/international_results/master/results.csv\"\n",
+    "os.makedirs(\"data\", exist_ok=True)\n",
+    "path = \"data/results.csv\"\n",
+    "if not os.path.exists(path):\n",
+    "    urllib.request.urlretrieve(URL, path)\n",
+    "\n",
+    "df = pd.read_csv(path, parse_dates=[\"date\"])\n",
+    "df = df[df[\"home_score\"].notna() & df[\"away_score\"].notna()].copy()\n",
+    "df[\"home_score\"] = df[\"home_score\"].astype(int)\n",
+    "df[\"away_score\"] = df[\"away_score\"].astype(int)\n",
+    "df[\"neutral\"] = df[\"neutral\"].astype(str).str.upper().eq(\"TRUE\")\n",
+    "df = df.sort_values(\"date\").reset_index(drop=True)\n",
+    "print(f\"Jogos com placar: {len(df)} | {df.date.min().date()} a {df.date.max().date()}\")\n",
+    "df.tail(3)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "85d7b544",
+   "metadata": {},
+   "source": [
+    "### Siglas oficiais e jogos da 1ª rodada\n",
+    "Mapeamento das 48 siglas para os nomes usados na base e a ordem **obrigatória** dos 24 jogos.\n",
+    "Sedes: México, Canadá e EUA são anfitriões — quando jogam em casa recebem vantagem de mando;\n",
+    "os demais jogos são tratados como **campo neutro**.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 3,
+   "id": "b4e81fc2",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:29.154035Z",
+     "iopub.status.busy": "2026-06-09T17:38:29.153335Z",
+     "iopub.status.idle": "2026-06-09T17:38:29.160694Z",
+     "shell.execute_reply": "2026-06-09T17:38:29.159747Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "24 jogos\n"
+     ]
+    }
+   ],
+   "source": [
+    "SIGLA2NAME = {\n",
+    "    \"MEX\":\"Mexico\",\"RSA\":\"South Africa\",\"KOR\":\"South Korea\",\"CZE\":\"Czech Republic\",\n",
+    "    \"CAN\":\"Canada\",\"SUI\":\"Switzerland\",\"QAT\":\"Qatar\",\"BIH\":\"Bosnia and Herzegovina\",\n",
+    "    \"BRA\":\"Brazil\",\"MAR\":\"Morocco\",\"HAI\":\"Haiti\",\"SCO\":\"Scotland\",\"USA\":\"United States\",\n",
+    "    \"PAR\":\"Paraguay\",\"AUS\":\"Australia\",\"TUR\":\"Turkey\",\"GER\":\"Germany\",\"CUW\":\"Curaçao\",\n",
+    "    \"CIV\":\"Ivory Coast\",\"ECU\":\"Ecuador\",\"NED\":\"Netherlands\",\"JPN\":\"Japan\",\"TUN\":\"Tunisia\",\n",
+    "    \"SWE\":\"Sweden\",\"BEL\":\"Belgium\",\"EGY\":\"Egypt\",\"IRN\":\"Iran\",\"NZL\":\"New Zealand\",\n",
+    "    \"ESP\":\"Spain\",\"CPV\":\"Cape Verde\",\"KSA\":\"Saudi Arabia\",\"URU\":\"Uruguay\",\"FRA\":\"France\",\n",
+    "    \"SEN\":\"Senegal\",\"NOR\":\"Norway\",\"IRQ\":\"Iraq\",\"ARG\":\"Argentina\",\"ALG\":\"Algeria\",\n",
+    "    \"AUT\":\"Austria\",\"JOR\":\"Jordan\",\"POR\":\"Portugal\",\"UZB\":\"Uzbekistan\",\"COL\":\"Colombia\",\n",
+    "    \"COD\":\"DR Congo\",\"ENG\":\"England\",\"CRO\":\"Croatia\",\"GHA\":\"Ghana\",\"PAN\":\"Panama\",\n",
+    "}\n",
+    "# (sigla1, sigla2, anfitriao|None) — anfitriao define o mando; None = neutro\n",
+    "FIXTURES = [\n",
+    "    (\"MEX\",\"RSA\",\"MEX\"),(\"KOR\",\"CZE\",None),(\"CAN\",\"BIH\",\"CAN\"),(\"USA\",\"PAR\",\"USA\"),\n",
+    "    (\"HAI\",\"SCO\",None),(\"AUS\",\"TUR\",None),(\"BRA\",\"MAR\",None),(\"QAT\",\"SUI\",None),\n",
+    "    (\"CIV\",\"ECU\",None),(\"GER\",\"CUW\",None),(\"NED\",\"JPN\",None),(\"SWE\",\"TUN\",None),\n",
+    "    (\"KSA\",\"URU\",None),(\"ESP\",\"CPV\",None),(\"IRN\",\"NZL\",None),(\"BEL\",\"EGY\",None),\n",
+    "    (\"FRA\",\"SEN\",None),(\"IRQ\",\"NOR\",None),(\"ARG\",\"ALG\",None),(\"AUT\",\"JOR\",None),\n",
+    "    (\"GHA\",\"PAN\",None),(\"ENG\",\"CRO\",None),(\"POR\",\"COD\",None),(\"UZB\",\"COL\",None),\n",
+    "]\n",
+    "assert all(s in SIGLA2NAME for f in FIXTURES for s in f[:2])\n",
+    "print(len(FIXTURES), \"jogos\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "cb3f4d65",
+   "metadata": {},
+   "source": [
+    "## 3. Pré-processamento — Elo e forma recente\n",
+    "Percorremos os jogos **em ordem cronológica** e mantemos um Elo por seleção (início em 1500).\n",
+    "A cada jogo, **antes** de atualizar, gravamos como features: Elo de cada time, e a média de gols\n",
+    "marcados/sofridos nos **últimos 10 jogos** (forma recente).\n",
+    "\n",
+    "Atualização Elo (estilo *World Football Elo*): peso `K` por importância do torneio (Copa=60,\n",
+    "continentais=50, eliminatórias/Nations League=40, amistoso=20), multiplicador pela **margem de\n",
+    "gols** e vantagem de mando de **65 pontos** (zerada em campo neutro).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "a7d80e7d",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:29.162446Z",
+     "iopub.status.busy": "2026-06-09T17:38:29.162232Z",
+     "iopub.status.idle": "2026-06-09T17:38:30.534722Z",
+     "shell.execute_reply": "2026-06-09T17:38:30.533601Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Top Elo atual:\n",
+      "Spain        2211.0\n",
+      "Argentina    2163.0\n",
+      "France       2118.0\n",
+      "England      2084.0\n",
+      "Brazil       2056.0\n",
+      "Colombia     2044.0\n",
+      "Portugal     2036.0\n",
+      "Ecuador      2016.0\n",
+      "dtype: float64\n"
+     ]
+    }
+   ],
+   "source": [
+    "def k_factor(t):\n",
+    "    t = str(t)\n",
+    "    if t == \"FIFA World Cup\": return 60.0\n",
+    "    if t in (\"Copa America\",\"UEFA Euro\",\"African Cup of Nations\",\n",
+    "             \"AFC Asian Cup\",\"Gold Cup\",\"Confederations Cup\"): return 50.0\n",
+    "    if \"qualif\" in t.lower() or \"Nations League\" in t: return 40.0\n",
+    "    if t == \"Friendly\": return 20.0\n",
+    "    return 30.0\n",
+    "\n",
+    "def goal_mult(gd):\n",
+    "    gd = abs(gd)\n",
+    "    if gd <= 1: return 1.0\n",
+    "    if gd == 2: return 1.5\n",
+    "    return (11.0 + gd) / 8.0\n",
+    "\n",
+    "HOME_ADV = 65.0\n",
+    "elo, hist = {}, {}\n",
+    "def get_elo(t): return elo.get(t, 1500.0)\n",
+    "def form(t):\n",
+    "    gs = hist.get(t, [])\n",
+    "    if not gs: return 1.2, 1.2\n",
+    "    return (np.mean([x[0] for x in gs[-10:]]), np.mean([x[1] for x in gs[-10:]]))\n",
+    "\n",
+    "cols = {k: np.zeros(len(df)) for k in [\"elo1\",\"elo2\",\"gf1\",\"ga1\",\"gf2\",\"ga2\"]}\n",
+    "for i, r in enumerate(df.itertuples(index=False)):\n",
+    "    h, a = r.home_team, r.away_team\n",
+    "    eh, ea = get_elo(h), get_elo(a)\n",
+    "    cols[\"elo1\"][i], cols[\"elo2\"][i] = eh, ea\n",
+    "    cols[\"gf1\"][i], cols[\"ga1\"][i] = form(h)\n",
+    "    cols[\"gf2\"][i], cols[\"ga2\"][i] = form(a)\n",
+    "    ha = 0.0 if r.neutral else HOME_ADV\n",
+    "    we = 1.0 / (1.0 + 10 ** (-((eh + ha) - ea) / 400.0))\n",
+    "    gd = r.home_score - r.away_score\n",
+    "    w = 1.0 if gd > 0 else (0.5 if gd == 0 else 0.0)\n",
+    "    k = k_factor(r.tournament) * goal_mult(gd)\n",
+    "    elo[h] = eh + k * (w - we)\n",
+    "    elo[a] = ea + k * ((1 - w) - (1 - we))\n",
+    "    hist.setdefault(h, []).append((r.home_score, r.away_score))\n",
+    "    hist.setdefault(a, []).append((r.away_score, r.home_score))\n",
+    "\n",
+    "for k, v in cols.items(): df[k] = v\n",
+    "df[\"elo_diff\"] = df[\"elo1\"] - df[\"elo2\"]\n",
+    "df[\"home1\"]    = (~df[\"neutral\"]).astype(float)\n",
+    "print(\"Top Elo atual:\")\n",
+    "print(pd.Series(elo).sort_values(ascending=False).head(8).round(0))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "6c2a3bf8",
+   "metadata": {},
+   "source": [
+    "### Montagem do conjunto, índices de seleção e split temporal\n",
+    "Usamos a **era moderna (2004+)** para treino (mais representativa do futebol atual), padronizamos\n",
+    "as features numéricas, e fazemos um **split temporal**: treino até maio/2022, validação a partir\n",
+    "de jun/2022 (evita olhar o futuro). Damos ainda **peso por recência** (meia-vida de 6 anos).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 5,
+   "id": "11b2c512",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:30.537340Z",
+     "iopub.status.busy": "2026-06-09T17:38:30.536675Z",
+     "iopub.status.idle": "2026-06-09T17:38:30.626652Z",
+     "shell.execute_reply": "2026-06-09T17:38:30.625649Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Treino 17301 | Validacao 4228 | Selecoes 336\n"
+     ]
+    }
+   ],
+   "source": [
+    "START_YEAR = 2004\n",
+    "train_df = df[df[\"date\"].dt.year >= START_YEAR].copy().reset_index(drop=True)\n",
+    "\n",
+    "teams = sorted(set(df[\"home_team\"]).union(df[\"away_team\"]))\n",
+    "team2idx = {t: i for i, t in enumerate(teams)}\n",
+    "NTEAMS = len(teams)\n",
+    "assert all(SIGLA2NAME[s] in team2idx for s in SIGLA2NAME)\n",
+    "\n",
+    "NUM_FEATS = [\"elo1\",\"elo2\",\"elo_diff\",\"home1\",\"gf1\",\"ga1\",\"gf2\",\"ga2\"]\n",
+    "mu = train_df[NUM_FEATS].mean(); sd = train_df[NUM_FEATS].std().replace(0,1)\n",
+    "\n",
+    "def make_xy(d):\n",
+    "    Xn = ((d[NUM_FEATS]-mu)/sd).values.astype(\"float32\")\n",
+    "    return ([d[\"home_team\"].map(team2idx).values.astype(\"int32\"),\n",
+    "             d[\"away_team\"].map(team2idx).values.astype(\"int32\"), Xn],\n",
+    "            d[[\"home_score\",\"away_score\"]].values.astype(\"float32\"))\n",
+    "\n",
+    "cut = pd.Timestamp(\"2022-06-01\")\n",
+    "tr = train_df[train_df[\"date\"] < cut]; va = train_df[train_df[\"date\"] >= cut]\n",
+    "Xtr, ytr = make_xy(tr); Xva, yva = make_xy(va)\n",
+    "age = (train_df[\"date\"].max() - tr[\"date\"]).dt.days.values / 365.25\n",
+    "w_tr = np.exp(-age / 6.0).astype(\"float32\")\n",
+    "print(f\"Treino {len(tr)} | Validacao {len(va)} | Selecoes {NTEAMS}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "494268df",
+   "metadata": {},
+   "source": [
+    "## 4. Modelo TensorFlow\n",
+    "**Arquitetura (API funcional):** *embeddings* de **ataque** e **defesa** (8 dim) para cada seleção,\n",
+    "concatenados com as 8 features numéricas → `Dense(64, relu)` → `Dropout` → `Dense(32, relu)` →\n",
+    "**duas saídas** com ativação **exponencial** (as taxas λ₁, λ₂ de Poisson, sempre positivas).\n",
+    "\n",
+    "**Perda:** `Poisson` (verossimilhança de contagem de gols) — mais adequada que MSE para placares.\n",
+    "**Otimizador:** Adam. **Regularização:** L2 + Dropout + *EarlyStopping* na perda de validação.\n",
+    "A ideia dos *embeddings* separados de ataque/defesa imita um modelo Dixon-Coles, mas aprendido\n",
+    "pela rede: λ₁ ≈ ataque(time1) × defesa(time2) × (mando/forma).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 6,
+   "id": "d94ddb53",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:30.629020Z",
+     "iopub.status.busy": "2026-06-09T17:38:30.628350Z",
+     "iopub.status.idle": "2026-06-09T17:38:40.979224Z",
+     "shell.execute_reply": "2026-06-09T17:38:40.978263Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Epochs: 28 | melhor val_loss: 0.7413\n"
+     ]
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"><span style=\"font-weight: bold\">Model: \"functional\"</span>\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "\u001b[1mModel: \"functional\"\u001b[0m\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\">┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓\n",
+       "┃<span style=\"font-weight: bold\"> Layer (type)        </span>┃<span style=\"font-weight: bold\"> Output Shape      </span>┃<span style=\"font-weight: bold\">    Param # </span>┃<span style=\"font-weight: bold\"> Connected to      </span>┃\n",
+       "┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩\n",
+       "│ team1 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">InputLayer</span>)  │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>)            │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ team2 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">InputLayer</span>)  │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>)            │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ atk (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Embedding</span>)     │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">8</span>)         │      <span style=\"color: #00af00; text-decoration-color: #00af00\">2,688</span> │ team1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],      │\n",
+       "│                     │                   │            │ team2[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ def (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Embedding</span>)     │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">8</span>)         │      <span style=\"color: #00af00; text-decoration-color: #00af00\">2,688</span> │ team1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],      │\n",
+       "│                     │                   │            │ team2[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ flatten (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Flatten</span>)   │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">8</span>)         │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ atk[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],        │\n",
+       "│                     │                   │            │ def[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],        │\n",
+       "│                     │                   │            │ atk[<span style=\"color: #00af00; text-decoration-color: #00af00\">1</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],        │\n",
+       "│                     │                   │            │ def[<span style=\"color: #00af00; text-decoration-color: #00af00\">1</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]         │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ num (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">InputLayer</span>)    │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">8</span>)         │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ concatenate         │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">40</span>)        │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ flatten[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],    │\n",
+       "│ (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Concatenate</span>)       │                   │            │ flatten[<span style=\"color: #00af00; text-decoration-color: #00af00\">1</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],    │\n",
+       "│                     │                   │            │ flatten[<span style=\"color: #00af00; text-decoration-color: #00af00\">2</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],    │\n",
+       "│                     │                   │            │ flatten[<span style=\"color: #00af00; text-decoration-color: #00af00\">3</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],    │\n",
+       "│                     │                   │            │ num[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]         │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dense (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dense</span>)       │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">64</span>)        │      <span style=\"color: #00af00; text-decoration-color: #00af00\">2,624</span> │ concatenate[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>] │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dropout (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dropout</span>)   │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">64</span>)        │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ dense[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dense_1 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dense</span>)     │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">32</span>)        │      <span style=\"color: #00af00; text-decoration-color: #00af00\">2,080</span> │ dropout[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]     │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dropout_1 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dropout</span>) │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">32</span>)        │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ dense_1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]     │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lam1 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dense</span>)        │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">1</span>)         │         <span style=\"color: #00af00; text-decoration-color: #00af00\">33</span> │ dropout_1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]   │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lam2 (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Dense</span>)        │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">1</span>)         │         <span style=\"color: #00af00; text-decoration-color: #00af00\">33</span> │ dropout_1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]   │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lams (<span style=\"color: #0087ff; text-decoration-color: #0087ff\">Concatenate</span>)  │ (<span style=\"color: #00d7ff; text-decoration-color: #00d7ff\">None</span>, <span style=\"color: #00af00; text-decoration-color: #00af00\">2</span>)         │          <span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> │ lam1[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>],       │\n",
+       "│                     │                   │            │ lam2[<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>][<span style=\"color: #00af00; text-decoration-color: #00af00\">0</span>]        │\n",
+       "└─────────────────────┴───────────────────┴────────────┴───────────────────┘\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓\n",
+       "┃\u001b[1m \u001b[0m\u001b[1mLayer (type)       \u001b[0m\u001b[1m \u001b[0m┃\u001b[1m \u001b[0m\u001b[1mOutput Shape     \u001b[0m\u001b[1m \u001b[0m┃\u001b[1m \u001b[0m\u001b[1m   Param #\u001b[0m\u001b[1m \u001b[0m┃\u001b[1m \u001b[0m\u001b[1mConnected to     \u001b[0m\u001b[1m \u001b[0m┃\n",
+       "┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩\n",
+       "│ team1 (\u001b[38;5;33mInputLayer\u001b[0m)  │ (\u001b[38;5;45mNone\u001b[0m)            │          \u001b[38;5;34m0\u001b[0m │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ team2 (\u001b[38;5;33mInputLayer\u001b[0m)  │ (\u001b[38;5;45mNone\u001b[0m)            │          \u001b[38;5;34m0\u001b[0m │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ atk (\u001b[38;5;33mEmbedding\u001b[0m)     │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m8\u001b[0m)         │      \u001b[38;5;34m2,688\u001b[0m │ team1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],      │\n",
+       "│                     │                   │            │ team2[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ def (\u001b[38;5;33mEmbedding\u001b[0m)     │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m8\u001b[0m)         │      \u001b[38;5;34m2,688\u001b[0m │ team1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],      │\n",
+       "│                     │                   │            │ team2[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ flatten (\u001b[38;5;33mFlatten\u001b[0m)   │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m8\u001b[0m)         │          \u001b[38;5;34m0\u001b[0m │ atk[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],        │\n",
+       "│                     │                   │            │ def[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],        │\n",
+       "│                     │                   │            │ atk[\u001b[38;5;34m1\u001b[0m][\u001b[38;5;34m0\u001b[0m],        │\n",
+       "│                     │                   │            │ def[\u001b[38;5;34m1\u001b[0m][\u001b[38;5;34m0\u001b[0m]         │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ num (\u001b[38;5;33mInputLayer\u001b[0m)    │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m8\u001b[0m)         │          \u001b[38;5;34m0\u001b[0m │ -                 │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ concatenate         │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m40\u001b[0m)        │          \u001b[38;5;34m0\u001b[0m │ flatten[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],    │\n",
+       "│ (\u001b[38;5;33mConcatenate\u001b[0m)       │                   │            │ flatten[\u001b[38;5;34m1\u001b[0m][\u001b[38;5;34m0\u001b[0m],    │\n",
+       "│                     │                   │            │ flatten[\u001b[38;5;34m2\u001b[0m][\u001b[38;5;34m0\u001b[0m],    │\n",
+       "│                     │                   │            │ flatten[\u001b[38;5;34m3\u001b[0m][\u001b[38;5;34m0\u001b[0m],    │\n",
+       "│                     │                   │            │ num[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]         │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dense (\u001b[38;5;33mDense\u001b[0m)       │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m64\u001b[0m)        │      \u001b[38;5;34m2,624\u001b[0m │ concatenate[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m] │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dropout (\u001b[38;5;33mDropout\u001b[0m)   │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m64\u001b[0m)        │          \u001b[38;5;34m0\u001b[0m │ dense[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]       │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dense_1 (\u001b[38;5;33mDense\u001b[0m)     │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m32\u001b[0m)        │      \u001b[38;5;34m2,080\u001b[0m │ dropout[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]     │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ dropout_1 (\u001b[38;5;33mDropout\u001b[0m) │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m32\u001b[0m)        │          \u001b[38;5;34m0\u001b[0m │ dense_1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]     │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lam1 (\u001b[38;5;33mDense\u001b[0m)        │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m1\u001b[0m)         │         \u001b[38;5;34m33\u001b[0m │ dropout_1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]   │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lam2 (\u001b[38;5;33mDense\u001b[0m)        │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m1\u001b[0m)         │         \u001b[38;5;34m33\u001b[0m │ dropout_1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]   │\n",
+       "├─────────────────────┼───────────────────┼────────────┼───────────────────┤\n",
+       "│ lams (\u001b[38;5;33mConcatenate\u001b[0m)  │ (\u001b[38;5;45mNone\u001b[0m, \u001b[38;5;34m2\u001b[0m)         │          \u001b[38;5;34m0\u001b[0m │ lam1[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m],       │\n",
+       "│                     │                   │            │ lam2[\u001b[38;5;34m0\u001b[0m][\u001b[38;5;34m0\u001b[0m]        │\n",
+       "└─────────────────────┴───────────────────┴────────────┴───────────────────┘\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"><span style=\"font-weight: bold\"> Total params: </span><span style=\"color: #00af00; text-decoration-color: #00af00\">30,440</span> (118.91 KB)\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "\u001b[1m Total params: \u001b[0m\u001b[38;5;34m30,440\u001b[0m (118.91 KB)\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"><span style=\"font-weight: bold\"> Trainable params: </span><span style=\"color: #00af00; text-decoration-color: #00af00\">10,146</span> (39.63 KB)\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "\u001b[1m Trainable params: \u001b[0m\u001b[38;5;34m10,146\u001b[0m (39.63 KB)\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"><span style=\"font-weight: bold\"> Non-trainable params: </span><span style=\"color: #00af00; text-decoration-color: #00af00\">0</span> (0.00 B)\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "\u001b[1m Non-trainable params: \u001b[0m\u001b[38;5;34m0\u001b[0m (0.00 B)\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    },
+    {
+     "data": {
+      "text/html": [
+       "<pre style=\"white-space:pre;overflow-x:auto;line-height:normal;font-family:Menlo,'DejaVu Sans Mono',consolas,'Courier New',monospace\"><span style=\"font-weight: bold\"> Optimizer params: </span><span style=\"color: #00af00; text-decoration-color: #00af00\">20,294</span> (79.28 KB)\n",
+       "</pre>\n"
+      ],
+      "text/plain": [
+       "\u001b[1m Optimizer params: \u001b[0m\u001b[38;5;34m20,294\u001b[0m (79.28 KB)\n"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "def build_model():\n",
+    "    in_t1 = tf.keras.Input(shape=(), dtype=\"int32\", name=\"team1\")\n",
+    "    in_t2 = tf.keras.Input(shape=(), dtype=\"int32\", name=\"team2\")\n",
+    "    in_n  = tf.keras.Input(shape=(len(NUM_FEATS),), dtype=\"float32\", name=\"num\")\n",
+    "    emb_atk = tf.keras.layers.Embedding(NTEAMS, 8, name=\"atk\")\n",
+    "    emb_def = tf.keras.layers.Embedding(NTEAMS, 8, name=\"def\")\n",
+    "    f = tf.keras.layers.Flatten()\n",
+    "    x = tf.keras.layers.Concatenate()(\n",
+    "        [f(emb_atk(in_t1)), f(emb_def(in_t1)),\n",
+    "         f(emb_atk(in_t2)), f(emb_def(in_t2)), in_n])\n",
+    "    x = tf.keras.layers.Dense(64, activation=\"relu\",\n",
+    "            kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)\n",
+    "    x = tf.keras.layers.Dropout(0.3)(x)\n",
+    "    x = tf.keras.layers.Dense(32, activation=\"relu\")(x)\n",
+    "    x = tf.keras.layers.Dropout(0.2)(x)\n",
+    "    lam1 = tf.keras.layers.Dense(1, activation=\"exponential\", name=\"lam1\")(x)\n",
+    "    lam2 = tf.keras.layers.Dense(1, activation=\"exponential\", name=\"lam2\")(x)\n",
+    "    out  = tf.keras.layers.Concatenate(name=\"lams\")([lam1, lam2])\n",
+    "    m = tf.keras.Model([in_t1, in_t2, in_n], out)\n",
+    "    m.compile(optimizer=tf.keras.optimizers.Adam(1e-3),\n",
+    "              loss=tf.keras.losses.Poisson())\n",
+    "    return m\n",
+    "\n",
+    "model = build_model()\n",
+    "es = tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True,\n",
+    "                                      monitor=\"val_loss\")\n",
+    "h = model.fit(Xtr, ytr, sample_weight=w_tr, validation_data=(Xva, yva),\n",
+    "              epochs=200, batch_size=256, callbacks=[es], verbose=0)\n",
+    "print(f\"Epochs: {len(h.history['loss'])} | melhor val_loss: {min(h.history['val_loss']):.4f}\")\n",
+    "model.summary()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "d4f31075",
+   "metadata": {},
+   "source": [
+    "## 5. Avaliação\n",
+    "**Escolha do placar.** Para taxas (λ₁, λ₂) assumimos gols independentes ~ Poisson. A probabilidade\n",
+    "do placar (a,b) é `P=Pois(a;λ₁)·Pois(b;λ₂)`. O ponto esperado de prever (a,b) é\n",
+    "`3·P(a,b) + 2·P(resultado(a,b))` (pois 5·P_exato + 2·(P_resultado − P_exato)). Varremos todos os\n",
+    "placares 0–8 e escolhemos o de **maior ponto esperado** — exatamente a métrica do bolão.\n",
+    "\n",
+    "**Comparação honesta.** Medimos os **pontos médios do bolão sobre os 4.228 jogos de validação**\n",
+    "contra dois baselines: prever sempre 1×1, e um baseline de Elo (favorito 1×0; equilíbrio 1×1).\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 7,
+   "id": "2af75370",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:40.981697Z",
+     "iopub.status.busy": "2026-06-09T17:38:40.980980Z",
+     "iopub.status.idle": "2026-06-09T17:38:42.725938Z",
+     "shell.execute_reply": "2026-06-09T17:38:42.724800Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "Validacao (4228 jogos) — pontos medios/jogo:\n",
+      "  Rede neural : 1.589\n",
+      "  Baseline 1x1: 0.764\n",
+      "  Baseline Elo: 1.553\n"
+     ]
+    }
+   ],
+   "source": [
+    "def best_scoreline(l1, l2, maxg=8):\n",
+    "    g = np.arange(0, maxg+1)\n",
+    "    P = np.outer(poisson.pmf(g, l1), poisson.pmf(g, l2)); P /= P.sum()\n",
+    "    pres = {\"1\": np.tril(P,-1).sum(), \"X\": np.trace(P), \"2\": np.triu(P,1).sum()}\n",
+    "    rfun = lambda a,b: \"1\" if a>b else (\"X\" if a==b else \"2\")\n",
+    "    best, bev = (0,0), -1\n",
+    "    for a in g:\n",
+    "        for b in g:\n",
+    "            ev = 3.0*P[a,b] + 2.0*pres[rfun(a,b)]\n",
+    "            if ev > bev: bev, best = ev, (int(a), int(b))\n",
+    "    return best, bev, pres\n",
+    "\n",
+    "def score_pred(pa,pb,ra,rb):\n",
+    "    if pa==ra and pb==rb: return 5\n",
+    "    rp = \"1\" if pa>pb else (\"X\" if pa==pb else \"2\")\n",
+    "    rr = \"1\" if ra>rb else (\"X\" if ra==rb else \"2\")\n",
+    "    return 2 if rp==rr else 0\n",
+    "\n",
+    "def elo_baseline(d):\n",
+    "    return (1,1) if abs(d)<40 else ((1,0) if d>0 else (0,1))\n",
+    "\n",
+    "lam_va = model.predict(Xva, verbose=0)\n",
+    "pm=p11=pelo=0.0\n",
+    "for k in range(len(va)):\n",
+    "    (pa,pb),_,_ = best_scoreline(*lam_va[k])\n",
+    "    ra,rb = int(yva[k][0]), int(yva[k][1])\n",
+    "    pm   += score_pred(pa,pb,ra,rb)\n",
+    "    p11  += score_pred(1,1,ra,rb)\n",
+    "    eb = elo_baseline(va.iloc[k][\"elo_diff\"]); pelo += score_pred(eb[0],eb[1],ra,rb)\n",
+    "N=len(va)\n",
+    "print(f\"Validacao ({N} jogos) — pontos medios/jogo:\")\n",
+    "print(f\"  Rede neural : {pm/N:.3f}\")\n",
+    "print(f\"  Baseline 1x1: {p11/N:.3f}\")\n",
+    "print(f\"  Baseline Elo: {pelo/N:.3f}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "ee0c3cdb",
+   "metadata": {},
+   "source": [
+    "**Limitações.** (i) Assumimos gols independentes (Poisson simples), ignorando correlação entre\n",
+    "os dois placares; (ii) o modelo não conhece lesões/escalações/calendário específicos de 2026;\n",
+    "(iii) futebol de seleções tem alta variância — uma rodada isolada é ruidosa (no exemplo de 16 jogos\n",
+    "da Copa 2022 o baseline de Elo chega a superar a rede, o que **não** se sustenta no conjunto grande).\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "b393024a",
+   "metadata": {},
+   "source": [
+    "## 6. Geração das previsões — 24 jogos\n",
+    "Para cada jogo de 2026 montamos as features com o **Elo final** (até 08/06/2026) e a forma recente\n",
+    "de cada seleção, aplicamos o mando para os anfitriões (MEX/CAN/USA) e escolhemos o placar de maior\n",
+    "ponto esperado.\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 8,
+   "id": "f18b6940",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:42.727834Z",
+     "iopub.status.busy": "2026-06-09T17:38:42.727666Z",
+     "iopub.status.idle": "2026-06-09T17:38:44.286046Z",
+     "shell.execute_reply": "2026-06-09T17:38:44.284812Z"
+    }
+   },
+   "outputs": [
+    {
+     "data": {
+      "text/html": [
+       "<div>\n",
+       "<style scoped>\n",
+       "    .dataframe tbody tr th:only-of-type {\n",
+       "        vertical-align: middle;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe tbody tr th {\n",
+       "        vertical-align: top;\n",
+       "    }\n",
+       "\n",
+       "    .dataframe thead th {\n",
+       "        text-align: right;\n",
+       "    }\n",
+       "</style>\n",
+       "<table border=\"1\" class=\"dataframe\">\n",
+       "  <thead>\n",
+       "    <tr style=\"text-align: right;\">\n",
+       "      <th></th>\n",
+       "      <th>jogo</th>\n",
+       "      <th>placar</th>\n",
+       "      <th>lam1</th>\n",
+       "      <th>lam2</th>\n",
+       "      <th>P1</th>\n",
+       "      <th>PX</th>\n",
+       "      <th>P2</th>\n",
+       "    </tr>\n",
+       "  </thead>\n",
+       "  <tbody>\n",
+       "    <tr>\n",
+       "      <th>0</th>\n",
+       "      <td>1</td>\n",
+       "      <td>MEX 1x0 RSA</td>\n",
+       "      <td>1.84</td>\n",
+       "      <td>0.55</td>\n",
+       "      <td>0.69</td>\n",
+       "      <td>0.21</td>\n",
+       "      <td>0.10</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>1</th>\n",
+       "      <td>2</td>\n",
+       "      <td>KOR 1x0 CZE</td>\n",
+       "      <td>1.30</td>\n",
+       "      <td>1.15</td>\n",
+       "      <td>0.40</td>\n",
+       "      <td>0.27</td>\n",
+       "      <td>0.33</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>2</th>\n",
+       "      <td>3</td>\n",
+       "      <td>CAN 2x0 BIH</td>\n",
+       "      <td>2.22</td>\n",
+       "      <td>0.49</td>\n",
+       "      <td>0.77</td>\n",
+       "      <td>0.16</td>\n",
+       "      <td>0.07</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>3</th>\n",
+       "      <td>4</td>\n",
+       "      <td>USA 1x0 PAR</td>\n",
+       "      <td>1.45</td>\n",
+       "      <td>1.10</td>\n",
+       "      <td>0.45</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.29</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>4</th>\n",
+       "      <td>5</td>\n",
+       "      <td>HAI 0x1 SCO</td>\n",
+       "      <td>0.87</td>\n",
+       "      <td>1.54</td>\n",
+       "      <td>0.21</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.53</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>5</th>\n",
+       "      <td>6</td>\n",
+       "      <td>AUS 0x1 TUR</td>\n",
+       "      <td>1.14</td>\n",
+       "      <td>1.45</td>\n",
+       "      <td>0.30</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.44</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>6</th>\n",
+       "      <td>7</td>\n",
+       "      <td>BRA 1x0 MAR</td>\n",
+       "      <td>1.23</td>\n",
+       "      <td>1.14</td>\n",
+       "      <td>0.38</td>\n",
+       "      <td>0.28</td>\n",
+       "      <td>0.34</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>7</th>\n",
+       "      <td>8</td>\n",
+       "      <td>QAT 0x2 SUI</td>\n",
+       "      <td>0.49</td>\n",
+       "      <td>2.27</td>\n",
+       "      <td>0.07</td>\n",
+       "      <td>0.16</td>\n",
+       "      <td>0.78</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>8</th>\n",
+       "      <td>9</td>\n",
+       "      <td>CIV 0x1 ECU</td>\n",
+       "      <td>0.84</td>\n",
+       "      <td>1.43</td>\n",
+       "      <td>0.22</td>\n",
+       "      <td>0.27</td>\n",
+       "      <td>0.51</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>9</th>\n",
+       "      <td>10</td>\n",
+       "      <td>GER 2x0 CUW</td>\n",
+       "      <td>2.17</td>\n",
+       "      <td>0.75</td>\n",
+       "      <td>0.70</td>\n",
+       "      <td>0.18</td>\n",
+       "      <td>0.12</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>10</th>\n",
+       "      <td>11</td>\n",
+       "      <td>NED 0x1 JPN</td>\n",
+       "      <td>1.11</td>\n",
+       "      <td>1.27</td>\n",
+       "      <td>0.32</td>\n",
+       "      <td>0.28</td>\n",
+       "      <td>0.40</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>11</th>\n",
+       "      <td>12</td>\n",
+       "      <td>SWE 1x0 TUN</td>\n",
+       "      <td>1.26</td>\n",
+       "      <td>1.24</td>\n",
+       "      <td>0.37</td>\n",
+       "      <td>0.27</td>\n",
+       "      <td>0.36</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>12</th>\n",
+       "      <td>13</td>\n",
+       "      <td>KSA 0x1 URU</td>\n",
+       "      <td>0.74</td>\n",
+       "      <td>1.68</td>\n",
+       "      <td>0.16</td>\n",
+       "      <td>0.24</td>\n",
+       "      <td>0.60</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>13</th>\n",
+       "      <td>14</td>\n",
+       "      <td>ESP 2x0 CPV</td>\n",
+       "      <td>2.83</td>\n",
+       "      <td>0.41</td>\n",
+       "      <td>0.87</td>\n",
+       "      <td>0.10</td>\n",
+       "      <td>0.03</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>14</th>\n",
+       "      <td>15</td>\n",
+       "      <td>IRN 1x0 NZL</td>\n",
+       "      <td>1.67</td>\n",
+       "      <td>0.67</td>\n",
+       "      <td>0.62</td>\n",
+       "      <td>0.24</td>\n",
+       "      <td>0.15</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>15</th>\n",
+       "      <td>16</td>\n",
+       "      <td>BEL 1x0 EGY</td>\n",
+       "      <td>1.56</td>\n",
+       "      <td>1.10</td>\n",
+       "      <td>0.48</td>\n",
+       "      <td>0.25</td>\n",
+       "      <td>0.27</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>16</th>\n",
+       "      <td>17</td>\n",
+       "      <td>FRA 1x0 SEN</td>\n",
+       "      <td>1.43</td>\n",
+       "      <td>1.09</td>\n",
+       "      <td>0.45</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.29</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>17</th>\n",
+       "      <td>18</td>\n",
+       "      <td>IRQ 0x1 NOR</td>\n",
+       "      <td>0.71</td>\n",
+       "      <td>1.70</td>\n",
+       "      <td>0.15</td>\n",
+       "      <td>0.24</td>\n",
+       "      <td>0.61</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>18</th>\n",
+       "      <td>19</td>\n",
+       "      <td>ARG 1x0 ALG</td>\n",
+       "      <td>1.79</td>\n",
+       "      <td>0.66</td>\n",
+       "      <td>0.64</td>\n",
+       "      <td>0.22</td>\n",
+       "      <td>0.13</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>19</th>\n",
+       "      <td>20</td>\n",
+       "      <td>AUT 1x0 JOR</td>\n",
+       "      <td>1.47</td>\n",
+       "      <td>1.07</td>\n",
+       "      <td>0.47</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.27</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>20</th>\n",
+       "      <td>21</td>\n",
+       "      <td>GHA 0x1 PAN</td>\n",
+       "      <td>0.84</td>\n",
+       "      <td>1.57</td>\n",
+       "      <td>0.20</td>\n",
+       "      <td>0.25</td>\n",
+       "      <td>0.54</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>21</th>\n",
+       "      <td>22</td>\n",
+       "      <td>ENG 1x0 CRO</td>\n",
+       "      <td>1.44</td>\n",
+       "      <td>1.02</td>\n",
+       "      <td>0.47</td>\n",
+       "      <td>0.26</td>\n",
+       "      <td>0.27</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>22</th>\n",
+       "      <td>23</td>\n",
+       "      <td>POR 1x0 COD</td>\n",
+       "      <td>1.90</td>\n",
+       "      <td>0.79</td>\n",
+       "      <td>0.64</td>\n",
+       "      <td>0.21</td>\n",
+       "      <td>0.15</td>\n",
+       "    </tr>\n",
+       "    <tr>\n",
+       "      <th>23</th>\n",
+       "      <td>24</td>\n",
+       "      <td>UZB 0x1 COL</td>\n",
+       "      <td>0.63</td>\n",
+       "      <td>1.95</td>\n",
+       "      <td>0.11</td>\n",
+       "      <td>0.20</td>\n",
+       "      <td>0.69</td>\n",
+       "    </tr>\n",
+       "  </tbody>\n",
+       "</table>\n",
+       "</div>"
+      ],
+      "text/plain": [
+       "    jogo       placar  lam1  lam2    P1    PX    P2\n",
+       "0      1  MEX 1x0 RSA  1.84  0.55  0.69  0.21  0.10\n",
+       "1      2  KOR 1x0 CZE  1.30  1.15  0.40  0.27  0.33\n",
+       "2      3  CAN 2x0 BIH  2.22  0.49  0.77  0.16  0.07\n",
+       "3      4  USA 1x0 PAR  1.45  1.10  0.45  0.26  0.29\n",
+       "4      5  HAI 0x1 SCO  0.87  1.54  0.21  0.26  0.53\n",
+       "5      6  AUS 0x1 TUR  1.14  1.45  0.30  0.26  0.44\n",
+       "6      7  BRA 1x0 MAR  1.23  1.14  0.38  0.28  0.34\n",
+       "7      8  QAT 0x2 SUI  0.49  2.27  0.07  0.16  0.78\n",
+       "8      9  CIV 0x1 ECU  0.84  1.43  0.22  0.27  0.51\n",
+       "9     10  GER 2x0 CUW  2.17  0.75  0.70  0.18  0.12\n",
+       "10    11  NED 0x1 JPN  1.11  1.27  0.32  0.28  0.40\n",
+       "11    12  SWE 1x0 TUN  1.26  1.24  0.37  0.27  0.36\n",
+       "12    13  KSA 0x1 URU  0.74  1.68  0.16  0.24  0.60\n",
+       "13    14  ESP 2x0 CPV  2.83  0.41  0.87  0.10  0.03\n",
+       "14    15  IRN 1x0 NZL  1.67  0.67  0.62  0.24  0.15\n",
+       "15    16  BEL 1x0 EGY  1.56  1.10  0.48  0.25  0.27\n",
+       "16    17  FRA 1x0 SEN  1.43  1.09  0.45  0.26  0.29\n",
+       "17    18  IRQ 0x1 NOR  0.71  1.70  0.15  0.24  0.61\n",
+       "18    19  ARG 1x0 ALG  1.79  0.66  0.64  0.22  0.13\n",
+       "19    20  AUT 1x0 JOR  1.47  1.07  0.47  0.26  0.27\n",
+       "20    21  GHA 0x1 PAN  0.84  1.57  0.20  0.25  0.54\n",
+       "21    22  ENG 1x0 CRO  1.44  1.02  0.47  0.26  0.27\n",
+       "22    23  POR 1x0 COD  1.90  0.79  0.64  0.21  0.15\n",
+       "23    24  UZB 0x1 COL  0.63  1.95  0.11  0.20  0.69"
+      ]
+     },
+     "metadata": {},
+     "output_type": "display_data"
+    }
+   ],
+   "source": [
+    "def latest_form(name):\n",
+    "    gs = hist.get(name, [])\n",
+    "    if not gs: return 1.2,1.2\n",
+    "    return np.mean([x[0] for x in gs[-10:]]), np.mean([x[1] for x in gs[-10:]])\n",
+    "\n",
+    "rows, resultados = [], {}\n",
+    "for n,(s1,s2,anf) in enumerate(FIXTURES, start=1):\n",
+    "    t1,t2 = SIGLA2NAME[s1], SIGLA2NAME[s2]\n",
+    "    e1,e2 = get_elo(t1), get_elo(t2)\n",
+    "    gf1,ga1 = latest_form(t1); gf2,ga2 = latest_form(t2)\n",
+    "    feat = {\"elo1\":e1,\"elo2\":e2,\"elo_diff\":e1-e2,\n",
+    "            \"home1\": 1.0 if anf==s1 else 0.0,\n",
+    "            \"gf1\":gf1,\"ga1\":ga1,\"gf2\":gf2,\"ga2\":ga2}\n",
+    "    Xn = np.array([[(feat[c]-mu[c])/sd[c] for c in NUM_FEATS]], dtype=\"float32\")\n",
+    "    l1,l2 = model.predict([np.array([team2idx[t1]]), np.array([team2idx[t2]]), Xn], verbose=0)[0]\n",
+    "    (g1,g2),ev,pres = best_scoreline(l1,l2)\n",
+    "    rows.append({\"jogo\":n,\"placar\":f\"{s1} {g1}x{g2} {s2}\",\n",
+    "                 \"lam1\":round(float(l1),2),\"lam2\":round(float(l2),2),\n",
+    "                 \"P1\":round(pres['1'],2),\"PX\":round(pres['X'],2),\"P2\":round(pres['2'],2)})\n",
+    "    resultados[f\"jogo{n}\"] = {s1:{\"gols\":g1}, s2:{\"gols\":g2}}\n",
+    "\n",
+    "tab = pd.DataFrame(rows)\n",
+    "display(tab)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 9,
+   "id": "f508f7e1",
+   "metadata": {
+    "execution": {
+     "iopub.execute_input": "2026-06-09T17:38:44.288077Z",
+     "iopub.status.busy": "2026-06-09T17:38:44.287868Z",
+     "iopub.status.idle": "2026-06-09T17:38:44.293964Z",
+     "shell.execute_reply": "2026-06-09T17:38:44.293129Z"
+    }
+   },
+   "outputs": [
+    {
+     "name": "stdout",
+     "output_type": "stream",
+     "text": [
+      "bolao_copa.txt salvo. Confira nome/turma!\n",
+      "{\n",
+      "  \"nome\": \"Flavia Cristina de Sousa Silva Dias Paz\",\n",
+      "  \"turma\": \"2/2026\",\n",
+      "  \"resultados\": {\n",
+      "    \"jogo1\": {\n",
+      "      \"MEX\": {\n",
+      "        \"gols\": 1\n",
+      "      },\n",
+      "      \"RSA\": {\n",
+      "        \"gols\": 0\n",
+      "      }\n",
+      "    },\n",
+      "    \"jogo2\": {\n",
+      "      \"KOR\": {\n",
+      "        \"gols\": 1\n",
+      "      },\n",
+      "      \"CZE\": {\n",
+      "        \"gols\": 0\n",
+      "      }\n",
+      "    },\n",
+      "    \"jogo3\": {\n",
+      "      \"CAN\": {\n",
+      "        \"gols\": 2\n",
+      "      },\n",
+      "      \"BIH\": {\n",
+      "        \"gols\": 0\n",
+      "      }\n",
+      "    } ...\n"
+     ]
+    }
+   ],
+   "source": [
+    "final = {\"nome\": NOME, \"turma\": TURMA, \"resultados\": resultados}\n",
+    "with open(\"bolao_copa.txt\", \"w\", encoding=\"utf-8\") as fp:\n",
+    "    json.dump(final, fp, ensure_ascii=False, indent=2)\n",
+    "print(\"bolao_copa.txt salvo. Confira nome/turma!\")\n",
+    "print(json.dumps(final, ensure_ascii=False, indent=2)[:400], \"...\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "8f670db3",
+   "metadata": {},
+   "source": [
+    "## 7. Conclusão\n",
+    "A rede neural Poisson com *embeddings* + Elo **supera** os baselines no conjunto de validação\n",
+    "(~1,59 pt/jogo vs. 1,55 do Elo e 0,76 do 1×1), o que projeta da ordem de **~38 pontos** nos 24 jogos\n",
+    "— sempre lembrando que **uma única rodada tem variância alta**.\n",
+    "\n",
+    "**Por que tantos placares 1×0 / 2×0:** sob a regra 5/2/0, prever placares baixos e prováveis\n",
+    "**maximiza o valor esperado** — capta tanto o resultado quanto o placar exato mais frequente.\n",
+    "\n",
+    "**Possíveis melhorias:** Poisson bivariada (Dixon-Coles) para correlação de gols; incluir ranking\n",
+    "FIFA, valor de mercado de elenco e descanso/viagem; *ensemble* de várias sementes; e simulação de\n",
+    "Monte Carlo para estimar a distribuição de pontos do bolão.\n",
+    "\n",
+    "> ⚠️ **Antes de entregar:** preencha `NOME` e `TURMA` na 2ª célula e rode o notebook todo. O arquivo\n",
+    "> `bolao_copa.txt` é gerado automaticamente no formato exigido.\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.3"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
